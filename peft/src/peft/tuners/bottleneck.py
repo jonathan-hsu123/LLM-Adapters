@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from ..utils import PeftConfig, PeftType, transpose
 from transformers.activations import ACT2FN
+from transformers.pytorch_utils import Conv1D
 
 
 TRANSFORMERS_MODELS_TO_ADAPTER_TYPE_MAPPING = {
@@ -140,6 +141,7 @@ class BottleneckModel(torch.nn.Module):
                 if not is_target_modules_in_base_model:
                     is_target_modules_in_base_model = True
                 parent, target, target_name = self._get_submodules(key)
+                print(target)
                 # determine the type of adapter to be used, this will effect the forward pass
                 if self.peft_config.use_parallel_adapter:
                     adapter_type = "parallel_adapter"
@@ -170,6 +172,21 @@ class BottleneckModel(torch.nn.Module):
                         new_module = Linear(target.out_features, target.out_features, bias=bias, **kwargs)
                     elif adapter_type == "parallel_adapter":
                         new_module = Linear(target.in_features, target.out_features, bias=bias, **kwargs)
+                elif isinstance(target, Conv1D):
+                    if adapter_type == "mh_adapter":
+                        nx = target.weight.shape[0]  # Input features
+                        nf = target.weight.shape[0]  # Output features
+                    elif adapter_type == "output_adapter":
+                        nx = target.nf               # Input features
+                        nf = target.nf               # Output features
+                    elif adapter_type == "parallel_adapter":
+                        nx = target.weight.shape[0]  # Input features
+                        nf = target.nf               # Output features
+                    new_module = Conv1DAdapter(
+                      nf=nf,
+                      nx=nx,
+                      **kwargs
+                    )
                 self._replace_module(parent, target_name, new_module, target)
         if not is_target_modules_in_base_model:
             raise ValueError(
@@ -389,6 +406,115 @@ class Linear(nn.Linear, AdapterLayer):
                 result = result + output
             return result
 
+class Conv1DAdapter(Conv1D, AdapterLayer):
+    def __init__(
+        self,
+        nf: int,
+        nx: int,
+        adapter_type: str,
+        bottleneck_size: int,
+        non_linearity: str,
+        adapter_dropout: float,
+        scaling: Union[float, str],
+        init_weights: str,
+        **kwargs,
+    ):
+        Conv1D.__init__(self, nf, nx)
+        AdapterLayer.__init__(
+            self,
+            bottleneck_size=bottleneck_size,
+            non_linearity=non_linearity,
+            adapter_dropout=adapter_dropout,
+            scaling=scaling,
+        )
+
+        self.init_weights = init_weights
+        self.adapter_type = adapter_type
+        if isinstance(scaling, float):
+            self.adapter_scaling = scaling
+        elif scaling == "learned":
+            self.adapter_scaling = nn.Parameter(torch.ones(1))
+        else:
+            self.adapter_scaling = 1.0  # Default scaling
+
+        # Adapter layers
+        self.adapter_down = Conv1D(bottleneck_size, nx)
+        self.adapter_up = Conv1D(nf, bottleneck_size)
+        self.act_fn = ACT2FN[self.non_linearity]
+
+        # Freeze the pre-trained weights
+        self.weight.requires_grad = False
+        self.bias.requires_grad = False
+
+    def train(self, mode: bool = True):
+        torch.nn.Conv1d.train(self, mode)
+        self.adapter_down.train(mode)
+        self.adapter_up.train(mode)
+
+    def eval(self):
+        torch.nn.Conv1d.eval(self)
+        self.adapter_down.eval()
+        self.adapter_up.eval()
+
+    def forward(self, x: torch.Tensor):
+        if self.disable_adapters:
+            return super().forward(x)
+        else:
+            if self.adapter_type == "mh_adapter":
+                # For mh_adapter, x will pass the adapter first and then the convolutional layer
+                expected_dtype = x.dtype
+                residual = x
+
+                if x.dtype != torch.float32:
+                    x = x.float()
+                output = (
+                    self.adapter_up(
+                        self.act_fn(self.adapter_down(self.adapter_dropout(x)))
+                    ).to(expected_dtype)
+                    * self.adapter_scaling
+                )
+
+                output = output + residual
+
+                result = super().forward(output)
+            elif self.adapter_type == "output_adapter":
+                # For output_adapter, x will pass the convolutional layer first and then the adapter
+                x = super().forward(x)
+                expected_dtype = x.dtype
+                residual = x
+
+                if x.dtype != torch.float32:
+                    x = x.float()
+
+                output = (
+                    self.adapter_up(
+                        self.act_fn(self.adapter_down(self.adapter_dropout(x)))
+                    ).to(expected_dtype)
+                    * self.adapter_scaling
+                )
+
+                result = output + residual
+            elif self.adapter_type == "parallel_adapter":
+                # For parallel_adapter, x will pass the convolutional layer first and the adapter layer parallelly.
+                # The output of the adapter layer will be added to the output of the convolutional layer
+                result = super().forward(x)
+                expected_dtype = result.dtype
+
+                if x.dtype != torch.float32:
+                    x = x.float()
+                output = (
+                    self.adapter_up(
+                        self.act_fn(self.adapter_down(self.adapter_dropout(x)))
+                    ).to(expected_dtype)
+                    * self.adapter_scaling
+                )
+
+                result = result + output
+            else:
+                raise ValueError(
+                    f"Unknown adapter_type: {self.adapter_type}. Expected one of ['mh_adapter', 'output_adapter', 'parallel_adapter']."
+                )
+            return result
 
 if is_bnb_available():
 
